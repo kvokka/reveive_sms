@@ -1,0 +1,103 @@
+#!/usr/bin/env ruby
+
+require 'httparty'
+require 'nokogiri'
+require 'progressbar'
+require 'hirb'
+
+module ReceiveSms
+  class Crawler
+    include HTTParty
+    base_uri 'receive-sms.cc'
+
+    def countries_paths
+      @countries_paths ||= Nokogiri::HTML(self.class.get("/Countries/").body).
+        css('.number-boxes-item-button').
+        map { |a| a.attributes&.fetch('href', nil)&.value }
+    rescue
+      puts '==> Failed to fetch countries list'
+      raise
+    end
+
+    def numbers
+      return @numbers if @numbers
+
+      progressbar = ProgressBar.create(total: countries_paths.size, title: ' Fetching countries data')
+      @numbers = countries_paths.each_with_object([]) do |country_path, acc|
+        country = country_path.match(%r{(\w+)-Phone-Number})&.captures&.first
+        first_page = Nokogiri::HTML(self.class.get(country_path).body)
+        last_page_number = first_page.
+          css('ul.pagination li').
+          last&.
+          children&.
+          last&.
+          attributes&.
+          fetch('href', nil)&.
+          value&.
+          split('/')&.
+          last&.
+          to_i
+
+        phone_number_pages = [first_page]
+        phone_number_pages += (2..last_page_number).map do |pn|
+          Nokogiri::HTML(self.class.get("#{country_path}/Page/#{pn}").body)
+        end if last_page_number.to_i > 1
+
+        phone_number_pages.each do |page|
+
+          page.css('.number-boxes-item-button').each do |button|
+            path = button.attributes&.fetch('href', nil)&.value
+            full_path = self.class.base_uri + path
+            number = path.split('/').last
+
+            acc << OpenStruct.new(country: country, path: path, full_path: full_path, number: number)
+          end
+        end
+        progressbar.increment
+      end
+    end
+
+    # No multithreading in here and i'm ok with it.
+    # Improve when this became too slow
+    def numbers_with_popularity
+      return @numbers_with_popularity if @numbers_with_popularity
+
+      progressbar = ProgressBar.create(total: numbers.size, title: ' Fetching numbers data')
+      @numbers_with_popularity = numbers.each_with_index do |number, i|
+        page = Nokogiri::HTML(self.class.get(number.path).body)
+        number.received = page.
+          search('div.row').
+          map(&:content).
+          map {|s| s.match(/Received (\d+) text messages\z/)&.captures&.first }.
+          compact.
+          first.
+          to_i
+        number.last_activity = page.
+          search('div.row.border-bottom.border-temps.table-hover').
+          first(3).
+          map{ |d| d.children[3].content }.
+          uniq.
+          map{ |s| s.sub(' ago', '') }.
+          join(', ').
+          concat(' ago')
+        progressbar.increment
+      rescue
+        puts "Something went wrong with number #{number.number} in the country #{number.country}. Skipping"
+        next
+      end
+    end
+  end
+end
+
+started_at = Time.now
+numbers= ReceiveSms::Crawler.new.numbers_with_popularity
+puts "It took #{(Time.now - started_at).to_i} seconds"
+
+extend Hirb::Console
+table numbers.
+  select(&:received).
+  sort_by(&:received).
+  reject { |n| n.last_activity =~ /day/ || n.last_activity =~ /week/ }.
+  reverse,
+  fields: [:full_path, :received, :last_activity]
+
