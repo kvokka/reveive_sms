@@ -17,3 +17,6 @@ Ruby 2.7 (untested with prior versions)
 ```bash
 bin/receive_sms
 ```
+
+Site might turn on DDOS protection and return `400` as a default value for
+`Received` field.

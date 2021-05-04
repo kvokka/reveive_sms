@@ -143,5 +143,7 @@ table numbers.
   select(&:received).
   sort_by(&:received).
   reject { |n| n.last_activity =~ /day/ || n.last_activity =~ /week/ },
-  fields: [:full_path, :received, :last_activity]
-
+  fields: [:full_path, :received, :last_activity],
+  resize: false,
+  max_fields: { :last_activity=> 40 },
+  headers: { last_activity: 'Last activity', full_path: 'URL', received: 'Received' }
