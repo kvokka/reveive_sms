@@ -97,7 +97,6 @@ extend Hirb::Console
 table numbers.
   select(&:received).
   sort_by(&:received).
-  reject { |n| n.last_activity =~ /day/ || n.last_activity =~ /week/ }.
-  reverse,
+  reject { |n| n.last_activity =~ /day/ || n.last_activity =~ /week/ },
   fields: [:full_path, :received, :last_activity]
 
