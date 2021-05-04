@@ -1,17 +1,29 @@
 #!/usr/bin/env ruby
 
-require 'httparty'
+require 'uri'
+require 'async'
+require 'async/barrier'
+require 'async/semaphore'
+require 'async/http/internet'
 require 'nokogiri'
 require 'progressbar'
 require 'hirb'
 
 module ReceiveSms
   class Crawler
-    include HTTParty
-    base_uri 'receive-sms.cc'
+    class << self
+      attr_accessor :base_uri
+      attr_accessor :concurrency
+      attr_accessor :timeout
+    end
+    self.base_uri = URI 'https://receive-sms.cc'
+    self.concurrency = 20
+    self.timeout = 60
 
     def countries_paths
-      @countries_paths ||= Nokogiri::HTML(self.class.get("/Countries/").body).
+      @countries_paths ||= fetch("/Countries/").
+        first.
+        html.
         css('.number-boxes-item-button').
         map { |a| a.attributes&.fetch('href', nil)&.value }
     rescue
@@ -23,10 +35,9 @@ module ReceiveSms
       return @numbers if @numbers
 
       progressbar = ProgressBar.create(total: countries_paths.size, title: ' Fetching countries data')
-      @numbers = countries_paths.each_with_object([]) do |country_path, acc|
-        country = country_path.match(%r{(\w+)-Phone-Number})&.captures&.first
-        first_page = Nokogiri::HTML(self.class.get(country_path).body)
-        last_page_number = first_page.
+      @numbers = fetch(countries_paths).each_with_object([]) do |first_page_per_country, acc|
+        last_page_number = first_page_per_country.
+          html.
           css('ul.pagination li').
           last&.
           children&.
@@ -38,19 +49,18 @@ module ReceiveSms
           last&.
           to_i
 
-        phone_number_pages = [first_page]
-        phone_number_pages += (2..last_page_number).map do |pn|
-          Nokogiri::HTML(self.class.get("#{country_path}/Page/#{pn}").body)
-        end if last_page_number.to_i > 1
+        pages = [first_page_per_country]
+        if last_page_number.to_i > 1
+          pages += fetch((2..last_page_number).map{ |pn| "#{first_page_per_country.path}/Page/#{pn}" })
+        end
+        pages.each do |page|
 
-        phone_number_pages.each do |page|
-
-          page.css('.number-boxes-item-button').each do |button|
+          page.html.css('.number-boxes-item-button').each do |button|
             path = button.attributes&.fetch('href', nil)&.value
             full_path = self.class.base_uri + path
             number = path.split('/').last
 
-            acc << OpenStruct.new(country: country, path: path, full_path: full_path, number: number)
+            acc << OpenStruct.new(path: path, full_path: full_path, number: number)
           end
         end
         progressbar.increment
@@ -63,9 +73,12 @@ module ReceiveSms
       return @numbers_with_popularity if @numbers_with_popularity
 
       progressbar = ProgressBar.create(total: numbers.size, title: ' Fetching numbers data')
-      @numbers_with_popularity = numbers.each_with_index do |number, i|
-        page = Nokogiri::HTML(self.class.get(number.path).body)
+      fetch(numbers.map(&:path)).each_with_index do |page, i|
+        number = numbers.detect { |n| n.path == page.path }
+        next (puts "===> Page for path #{path} not found") unless number
+
         number.received = page.
+          html.
           search('div.row').
           map(&:content).
           map {|s| s.match(/Received (\d+) text messages\z/)&.captures&.first }.
@@ -73,6 +86,7 @@ module ReceiveSms
           first.
           to_i
         number.last_activity = page.
+          html.
           search('div.row.border-bottom.border-temps.table-hover').
           first(3).
           map{ |d| d.children[3].content }.
@@ -82,8 +96,39 @@ module ReceiveSms
           concat(' ago')
         progressbar.increment
       rescue
-        puts "Something went wrong with number #{number.number} in the country #{number.country}. Skipping"
+        puts "===> Something went wrong with number #{number.number}. Skipping"
         next
+      end
+      @numbers_with_popularity = numbers
+    end
+
+    private
+
+    def fetch(paths)
+      [].tap do |result|
+        Async do |task|
+          internet = Async::HTTP::Internet.new
+          barrier = Async::Barrier.new
+          semaphore = Async::Semaphore.new(self.class.concurrency, parent: barrier)
+
+          # Spawn an asynchronous task for each topic:
+            task.with_timeout(self.class.timeout) do
+              Array(paths).each do |path|
+                semaphore.async do
+                  headers = [['User-Agent', "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:#{rand(47..80)}.0) Gecko/20100101 Firefox/#{rand(47..80)}.0"]]
+                  response = internet.get((self.class.base_uri + path).to_s, headers)
+                  result << OpenStruct.new(path: path, html: Nokogiri::HTML(response.read))
+                end
+              end
+
+            # Ensure we wait for all requests to complete before continuing:
+            barrier.wait
+          end
+        rescue Async::TimeoutError
+          puts "===> The request timed out for #{path}"
+        ensure
+          internet&.close
+        end
       end
     end
   end
